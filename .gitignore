@@ -22,6 +22,9 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.keras
+*.h5
+models/
 
 # Virtual Environment
 venv/
