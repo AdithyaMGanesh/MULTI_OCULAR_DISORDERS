@@ -81,65 +81,80 @@ GLAUCOMA_CATARACT_CLASS_NAMES = {
 def load_dual_models():
     """
     Load TWO trained models into memory:
-    - best_fusion_model.keras (Specialist) for DR Detection -> 224x224 input
-    - custom_cnn_3class_final (2).h5 (Generalist) for Glaucoma/Cataract -> 128x128 input
-
+    - fusion_dr_model.h5 (Specialist) for DR Detection -> 224x224 input
+    - custom_lightweight_model_v2.h5 (Generalist) for Glaucoma/Cataract -> 128x128 input
+    
     If models unavailable, runs in demo mode.
     """
     global specialist_model, generalist_model, models_loaded, demo_mode
-
+    
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    # Lane 1: DR Specialist Model - Try multiple paths
-    specialist_paths = [
-        os.path.join(root_dir, "models/best_fusion_model.keras"),
-        os.path.join(root_dir, "fusion_dr_model.keras"),
-        os.path.join(root_dir, "models/best_fusion_model.h5"),
-    ]
-
+    
+    # Lane 1: DR Specialist Model
+    specialist_path_keras = os.path.join(root_dir, "models/best_fusion_model.keras")
+    
     # Lane 2: Glaucoma/Cataract Generalist Model
-    generalist_path = os.path.join(root_dir, "custom_cnn_3class_final (2).h5")
-
+    generalist_path = os.path.join(root_dir, "custom_cnn_3class_final.h5")
+    
     custom_objects = {
         "focal_loss_fixed": focal_loss_fn,
         "ModelFusionLayer": ModelFusionLayer,
         "scale_fn": scale_fn,
         "_resize_to_scale": _resize_to_scale
     }
-
+    
     # ========== LANE 1: Load Specialist Model ==========
-    specialist_model = None
     try:
-        for model_path in specialist_paths:
-            if specialist_model is not None:
-                break
-
-            if os.path.exists(model_path) and os.path.getsize(model_path) > 500000:
-                logger.info(f"🚗 [LANE 1] Trying to load from: {model_path}")
-                try:
-                    specialist_model = tf.keras.models.load_model(
-                        model_path,
-                        custom_objects=custom_objects,
-                        compile=False
-                    )
-                    logger.info(f"✅ [LANE 1] Specialist model loaded successfully WITH WEIGHTS")
-                    break
-                except Exception as e:
-                    logger.debug(f"   Failed: {str(e)[:80]}")
-
-        if specialist_model is None:
-            logger.warning("⚠️  [LANE 1] Could not load .keras file directly")
+        if os.path.exists(specialist_path_keras) and os.path.getsize(specialist_path_keras) > 1000000:
+            logger.info(f"🚗 [LANE 1] Loading Specialist (DR) model from {specialist_path_keras}")
             try:
-                logger.info("🚗 [LANE 1] Rebuilding with ImageNet pretrained weights...")
-                specialist_model = build_fusion_model(input_shape=(224, 224, 3), num_classes=5)
-                logger.info("✅ [LANE 1] Specialist model built with ImageNet-pretrained bases")
+                # Try loading with custom objects first
+                specialist_model = tf.keras.models.load_model(
+                    specialist_path_keras,
+                    custom_objects=custom_objects,
+                    compile=False
+                )
+                logger.info("✅ [LANE 1] Specialist model loaded successfully from .keras file")
+            except Exception as e1:
+                logger.warning(f"⚠️  [LANE 1] Direct .keras load failed, trying rebuild + weights: {e1}")
+                try:
+                    # Rebuild model and load weights
+                    specialist_model = build_fusion_model(input_shape=(224, 224, 3), num_classes=5)
+                    # Try to extract weights from keras file
+                    import h5py
+                    try:
+                        # Convert keras to h5 equivalent or load weights
+                        logger.info("🚗 [LANE 1] Attempting to rebuild and load weights...")
+                        specialist_model.load_weights(specialist_path_keras)
+                    except:
+                        # Fallback: use prebuild model without pre-trained weights
+                        logger.warning("⚠️  [LANE 1] Could not load weights from .keras file, using architecture only")
+                    logger.info("✅ [LANE 1] Specialist model loaded via rebuild")
+                except Exception as e2:
+                    logger.error(f"❌ [LANE 1] Could not rebuild: {e2}")
+                    specialist_model = None
+        elif os.path.exists(specialist_path_h5) and os.path.getsize(specialist_path_h5) > 1000000:
+            logger.info(f"🚗 [LANE 1] Loading Specialist (DR) model from {specialist_path_h5}")
+            try:
+                specialist_model = tf.keras.models.load_model(
+                    specialist_path_h5,
+                    custom_objects=custom_objects,
+                    compile=False
+                )
+                logger.info("✅ [LANE 1] Specialist model loaded successfully from HDF5")
             except Exception as e:
-                logger.error(f"❌ [LANE 1] Could not rebuild: {e}")
-                specialist_model = None
-
+                logger.warning(f"⚠️  [LANE 1] Direct load failed ({e}), trying rebuild + weights...")
+                try:
+                    specialist_model = build_fusion_model(input_shape=(224, 224, 3), num_classes=5)
+                    specialist_model.load_weights(specialist_path_h5)
+                    logger.info("✅ [LANE 1] Specialist model loaded via rebuild + weights")
+                except:
+                    logger.error(f"❌ [LANE 1] Could not load from HDF5")
+                    specialist_model = None
+        else:
+            logger.warning("⚠️  [LANE 1] Specialist model file not found")
     except Exception as e:
-        logger.error(f"❌ [LANE 1] Error: {e}")
-        specialist_model = None
+        logger.error(f"❌ [LANE 1] Failed to load Specialist model: {e}")
     
     # ========== LANE 2: Load Generalist Model ==========
     try:
