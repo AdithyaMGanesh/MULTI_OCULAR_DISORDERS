@@ -91,8 +91,7 @@ def load_dual_models():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     
     # Lane 1: DR Specialist Model
-    specialist_path_keras = os.path.join(root_dir, "fusion_dr_model.keras")
-    specialist_path_h5 = os.path.join(root_dir, "fusion_dr_model.h5")
+    specialist_path_keras = os.path.join(root_dir, "models/best_fusion_model.keras")
     
     # Lane 2: Glaucoma/Cataract Generalist Model
     generalist_path = os.path.join(root_dir, "custom_cnn_3class_final (2).h5")
