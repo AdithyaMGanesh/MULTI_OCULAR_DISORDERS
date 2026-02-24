@@ -13,7 +13,13 @@ def find_last_conv_layer(model):
     for layer in reversed(model.layers):
         if isinstance(layer, tf.keras.layers.Conv2D):
             return layer.name
-    raise ValueError("No Conv2D layer found in model.")
+    
+    # Fallback: try to find any layer with spatial dimensions
+    for layer in reversed(model.layers):
+        if hasattr(layer, 'output_shape') and len(layer.output_shape) >= 3:
+            return layer.name
+    
+    raise ValueError("No suitable layer found for Grad-CAM.")
 
 
 def generate_gradcam(

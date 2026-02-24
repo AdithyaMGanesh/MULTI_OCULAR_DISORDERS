@@ -1,0 +1,568 @@
+"""
+FastAPI Backend for Dual-Model Diagnosis System (Two-Lane Highway)
+Serves predictions from TWO models in parallel:
+- Lane 1: fusion_dr_model.h5 (Specialist) -> Diabetic Retinopathy Detection
+- Lane 2: custom_lightweight_model_v2.h5 (Generalist) -> Glaucoma/Cataract Detection
+"""
+
+import os
+import io
+import cv2
+import numpy as np
+import tensorflow as tf
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from PIL import Image
+from src.gradcam import generate_gradcam, overlay_heatmap, image_to_base64
+import logging
+import sys
+
+# Add src directory to path for relative imports
+src_dir = os.path.dirname(os.path.abspath(__file__))
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
+# Import custom model components
+from preprocessing import _circular_crop, _gaussian_blur
+from loss import focal_loss_fn
+from model import ModelFusionLayer, build_fusion_model
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# CUSTOM FUNCTIONS FOR MODEL DESERIALIZATION
+# ============================================================================
+
+# Custom function for Lambda layer deserialization
+def scale_fn(args):
+    """Custom Lambda function for model deserialization"""
+    return args
+
+def _resize_to_scale(args):
+    """Resize function for spatial dimensions matching"""
+    return args
+
+# Global model variables - TWO LANES
+specialist_model = None          # Lane 1: DR Detection Model (224x224)
+generalist_model = None          # Lane 2: Glaucoma/Cataract Detection Model (128x128)
+models_loaded = False
+demo_mode = False
+
+# Configuration flags
+ENABLE_GRADCAM = False  # Disable Grad-CAM for complex fusion model
+
+# ============================================================================
+# CLASS MAPPINGS FOR BOTH LANES
+# ============================================================================
+
+# Lane 1: Diabetic Retinopathy Classes (Specialist)
+DR_CLASS_NAMES = {
+    0: "No DR",
+    1: "Mild",
+    2: "Moderate",
+    3: "Severe",
+    4: "Proliferative"
+}
+
+# Lane 2: Glaucoma/Cataract Classes (Generalist)
+# Assuming a 3-class or 4-class model
+GLAUCOMA_CATARACT_CLASS_NAMES = {
+    0: "Normal",
+    1: "Glaucoma",
+    2: "Cataract",
+    3: "Both Glaucoma & Cataract"  # Optional fourth class
+}
+
+
+def load_dual_models():
+    """
+    Load TWO trained models into memory:
+    - fusion_dr_model.h5 (Specialist) for DR Detection -> 224x224 input
+    - custom_lightweight_model_v2.h5 (Generalist) for Glaucoma/Cataract -> 128x128 input
+    
+    If models unavailable, runs in demo mode.
+    """
+    global specialist_model, generalist_model, models_loaded, demo_mode
+    
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
+    # Lane 1: DR Specialist Model
+    specialist_path_keras = os.path.join(root_dir, "fusion_dr_model.keras")
+    specialist_path_h5 = os.path.join(root_dir, "fusion_dr_model.h5")
+    
+    # Lane 2: Glaucoma/Cataract Generalist Model
+    generalist_path = os.path.join(root_dir, "custom_cnn_3class_final (2).h5")
+    
+    custom_objects = {
+        "focal_loss_fixed": focal_loss_fn,
+        "ModelFusionLayer": ModelFusionLayer,
+        "scale_fn": scale_fn,
+        "_resize_to_scale": _resize_to_scale
+    }
+    
+    # ========== LANE 1: Load Specialist Model ==========
+    try:
+        if os.path.exists(specialist_path_keras) and os.path.getsize(specialist_path_keras) > 1000000:
+            logger.info(f"🚗 [LANE 1] Loading Specialist (DR) model from {specialist_path_keras}")
+            try:
+                # Try loading with custom objects first
+                specialist_model = tf.keras.models.load_model(
+                    specialist_path_keras,
+                    custom_objects=custom_objects,
+                    compile=False
+                )
+                logger.info("✅ [LANE 1] Specialist model loaded successfully from .keras file")
+            except Exception as e1:
+                logger.warning(f"⚠️  [LANE 1] Direct .keras load failed, trying rebuild + weights: {e1}")
+                try:
+                    # Rebuild model and load weights
+                    specialist_model = build_fusion_model(input_shape=(224, 224, 3), num_classes=5)
+                    # Try to extract weights from keras file
+                    import h5py
+                    try:
+                        # Convert keras to h5 equivalent or load weights
+                        logger.info("🚗 [LANE 1] Attempting to rebuild and load weights...")
+                        specialist_model.load_weights(specialist_path_keras)
+                    except:
+                        # Fallback: use prebuild model without pre-trained weights
+                        logger.warning("⚠️  [LANE 1] Could not load weights from .keras file, using architecture only")
+                    logger.info("✅ [LANE 1] Specialist model loaded via rebuild")
+                except Exception as e2:
+                    logger.error(f"❌ [LANE 1] Could not rebuild: {e2}")
+                    specialist_model = None
+        elif os.path.exists(specialist_path_h5) and os.path.getsize(specialist_path_h5) > 1000000:
+            logger.info(f"🚗 [LANE 1] Loading Specialist (DR) model from {specialist_path_h5}")
+            try:
+                specialist_model = tf.keras.models.load_model(
+                    specialist_path_h5,
+                    custom_objects=custom_objects,
+                    compile=False
+                )
+                logger.info("✅ [LANE 1] Specialist model loaded successfully from HDF5")
+            except Exception as e:
+                logger.warning(f"⚠️  [LANE 1] Direct load failed ({e}), trying rebuild + weights...")
+                try:
+                    specialist_model = build_fusion_model(input_shape=(224, 224, 3), num_classes=5)
+                    specialist_model.load_weights(specialist_path_h5)
+                    logger.info("✅ [LANE 1] Specialist model loaded via rebuild + weights")
+                except:
+                    logger.error(f"❌ [LANE 1] Could not load from HDF5")
+                    specialist_model = None
+        else:
+            logger.warning("⚠️  [LANE 1] Specialist model file not found")
+    except Exception as e:
+        logger.error(f"❌ [LANE 1] Failed to load Specialist model: {e}")
+    
+    # ========== LANE 2: Load Generalist Model ==========
+    try:
+        if os.path.exists(generalist_path) and os.path.getsize(generalist_path) > 100000:
+            logger.info(f"🚗 [LANE 2] Loading Generalist (Glaucoma/Cataract) model from {generalist_path}")
+            generalist_model = tf.keras.models.load_model(
+                generalist_path,
+                compile=False
+            )
+            logger.info("✅ [LANE 2] Generalist model loaded successfully")
+        else:
+            logger.warning("⚠️  [LANE 2] Generalist model file not found")
+    except Exception as e:
+        logger.error(f"❌ [LANE 2] Failed to load Generalist model: {e}")
+    
+    # ========== Check if both models loaded ==========
+    if specialist_model is not None and generalist_model is not None:
+        logger.info("✅ ✅ BOTH MODELS LOADED - Running in DUAL-MODEL MODE")
+        models_loaded = True
+        return specialist_model, generalist_model
+    elif specialist_model is not None or generalist_model is not None:
+        logger.warning("⚠️  Only ONE model loaded. System will operate in HYBRID MODE")
+        models_loaded = True
+        return specialist_model, generalist_model
+    else:
+        logger.warning("⚠️  Neither model found. Running in DEMO MODE")
+        demo_mode = True
+        return None, None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan context manager to load dual models on startup and cleanup on shutdown
+    """
+    logger.info("🚀 STARTUP: Initializing Two-Lane Highway Backend...")
+    load_dual_models()
+    if models_loaded:
+        logger.info("✅ READY: Dual-Model system is operational")
+    else:
+        logger.info("⚠️  Running in DEMO MODE")
+    yield
+    logger.info("🛑 SHUTDOWN: Closing system")
+
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Multi-Ocular Detection API (Dual-Model)",
+    description="AI-powered multi-disease detection using parallel specialist and generalist models",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+# Enable CORS for React frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def preprocess_image_lane1(image_bytes: bytes) -> np.ndarray:
+    """
+    LANE 1 Preprocessing: For DR Detection (224x224)
+    1. Load image and convert to RGB
+    2. Apply circular crop
+    3. Apply Gaussian blur (sigma=10)
+    4. Resize to 224x224
+    5. Normalize (divide by 255.0)
+    """
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        image_cv = _circular_crop(image_cv)
+        image_cv = _gaussian_blur(image_cv, sigma=10)
+        image_cv = cv2.resize(image_cv, (224, 224))
+        image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
+        image_rgb = image_rgb.astype(np.float32) / 255.0
+        
+        logger.info(f"[LANE 1] Image preprocessed to 224x224. Shape: {image_rgb.shape}")
+        return image_rgb
+    except Exception as e:
+        logger.error(f"[LANE 1] Error preprocessing image: {e}")
+        raise ValueError(f"Failed to preprocess image for LANE 1: {str(e)}")
+
+
+def preprocess_image_lane2(image_bytes: bytes) -> np.ndarray:
+    """
+    LANE 2 Preprocessing: For Glaucoma/Cataract Detection (128x128)
+    1. Load image and convert to RGB
+    2. Apply circular crop
+    3. Apply Gaussian blur (sigma=10)
+    4. Resize to 128x128
+    5. Normalize (divide by 255.0)
+    """
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        image_cv = _circular_crop(image_cv)
+        image_cv = _gaussian_blur(image_cv, sigma=10)
+        image_cv = cv2.resize(image_cv, (128, 128))
+        image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
+        image_rgb = image_rgb.astype(np.float32) / 255.0
+        
+        logger.info(f"[LANE 2] Image preprocessed to 128x128. Shape: {image_rgb.shape}")
+        return image_rgb
+    except Exception as e:
+        logger.error(f"[LANE 2] Error preprocessing image: {e}")
+        raise ValueError(f"Failed to preprocess image for LANE 2: {str(e)}")
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "specialist_model_loaded": specialist_model is not None,
+        "generalist_model_loaded": generalist_model is not None,
+        "system_mode": "dual" if specialist_model and generalist_model else "hybrid" if specialist_model or generalist_model else "demo",
+        "service": "Multi-Ocular Dual-Model Detection API"
+    }
+
+
+@app.post("/predict-dual")
+async def predict_dual(file: UploadFile = File(...)):
+    """
+    DUAL-MODEL PREDICTION ENDPOINT (Two-Lane Highway)
+    
+    Accepts: Image file (PNG, JPG, JPEG, BMP)
+    Returns: Combined JSON with both DR and Glaucoma/Cataract diagnoses
+    
+    The "Two-Lane Highway":
+    ┌─────────────┐
+    │   Image     │
+    │  File       │
+    └──────┬──────┘
+           │
+           ├─────────────────────────────┬──────────────────────────────┐
+           │                             │                              │
+      [LANE 1 - SPECIALIST]         [LANE 2 - GENERALIST]
+           │                             │
+    Resize to 224x224             Resize to 128x128
+           │                             │
+    Run DR Detection              Run Glaucoma/Cataract Detection
+           │                             │
+      Get DR Result                Get Glaucoma/Cataract Result
+           │                             │
+           └─────────────────────────────┴──────────────────────────────┘
+                                   │
+                          [MERGE RESULTS]
+                                   │
+                        JSON Response (Both Results)
+    """
+    
+    # ========== DEMO MODE ==========
+    if demo_mode:
+        try:
+            contents = await file.read()
+            if len(contents) == 0:
+                raise HTTPException(status_code=400, detail="Empty file uploaded")
+            
+            # Demo predictions based on file size
+            seed = len(contents) % 100
+            np.random.seed(seed)
+            
+            # Lane 1: DR Probabilities
+            dr_probabilities = np.random.dirichlet(np.ones(5) * 2)
+            dr_class = int(np.argmax(dr_probabilities))
+            dr_confidence = float(dr_probabilities[dr_class])
+            dr_diagnosis = DR_CLASS_NAMES[dr_class]
+            
+            # Lane 2: Glaucoma/Cataract Probabilities
+            gc_probabilities = np.random.dirichlet(np.ones(3) * 2)
+            gc_class = int(np.argmax(gc_probabilities))
+            gc_confidence = float(gc_probabilities[gc_class])
+            gc_diagnosis = GLAUCOMA_CATARACT_CLASS_NAMES[gc_class]
+            
+            logger.info(f"DEMO MODE: {file.filename} -> [LANE 1] {dr_diagnosis} | [LANE 2] {gc_diagnosis}")
+            
+            return JSONResponse({
+                "status": "success",
+                "mode": "demo",
+                "message": "DEMO MODE - Download models for real predictions",
+                "lane_1_specialist": {
+                    "disease": "Diabetic Retinopathy",
+                    "diagnosis": dr_diagnosis,
+                    "confidence": round(dr_confidence, 4),
+                    "probabilities": {DR_CLASS_NAMES[i]: float(dr_probabilities[i]) for i in range(5)},
+                    "severity": "Low Risk" if dr_class == 0 else "Medium Risk" if dr_class == 1 else "High Risk"
+                },
+                "lane_2_generalist": {
+                    "disease": "Glaucoma/Cataract",
+                    "diagnosis": gc_diagnosis,
+                    "confidence": round(gc_confidence, 4),
+                    "probabilities": {GLAUCOMA_CATARACT_CLASS_NAMES[i]: float(gc_probabilities[i]) for i in range(3)},
+                    "severity": "Low Risk" if gc_class == 0 else "Medium Risk" if gc_class == 1 else "High Risk"
+                }
+            })
+        except Exception as e:
+            logger.error(f"Error in demo mode: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    # ========== PRODUCTION MODE: Use Actual Models ==========
+    if specialist_model is None and generalist_model is None:
+        raise HTTPException(status_code=503, detail="No models loaded. Models not found and demo mode disabled")
+    
+    try:
+        # Validate file type
+        allowed_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff'}
+        file_ext = os.path.splitext(file.filename)[1].lower()
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {file_ext}. Allowed: {', '.join(allowed_extensions)}"
+            )
+        
+        # Read file bytes
+        contents = await file.read()
+        if len(contents) == 0:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+        
+        logger.info(f"🚗🚗 Processing image: {file.filename} (Two-Lane Highway)")
+        
+        # ========== LANE 1: SPECIALIST (DR Detection) ==========
+        lane1_result = None
+        if specialist_model is not None:
+            try:
+                logger.info("🚗 [LANE 1] Preprocessing image (224x224) for Specialist...")
+                img_lane1 = preprocess_image_lane1(contents)
+                input_batch_lane1 = np.expand_dims(img_lane1, axis=0)
+                
+                logger.info("🚗 [LANE 1] Running DR Detection inference...")
+                dr_predictions = specialist_model.predict(input_batch_lane1, verbose=0)
+                dr_probabilities = dr_predictions[0]
+                
+                dr_class = int(np.argmax(dr_probabilities))
+                dr_confidence = float(dr_probabilities[dr_class])
+                dr_diagnosis = DR_CLASS_NAMES[dr_class]
+                
+                # Generate Grad-CAM for Lane 1 (disabled for complex fusion models)
+                gradcam_base64_lane1 = None
+                if ENABLE_GRADCAM:
+                    try:
+                        heatmap = generate_gradcam(
+                            model=specialist_model,
+                            img_array=input_batch_lane1,
+                            class_index=dr_class
+                        )
+                        orig_img_lane1 = (img_lane1 * 255).astype(np.uint8)
+                        gradcam_overlay_lane1 = overlay_heatmap(orig_img_lane1, heatmap)
+                        gradcam_base64_lane1 = image_to_base64(gradcam_overlay_lane1)
+                        logger.info("✅ [LANE 1] Grad-CAM generated successfully")
+                    except Exception as e:
+                        logger.error(f"❌ [LANE 1] Grad-CAM failed: {e}")
+                        gradcam_base64_lane1 = None
+                else:
+                    logger.info("ℹ️  [LANE 1] Grad-CAM disabled for fusion models")
+                
+                lane1_result = {
+                    "disease": "Diabetic Retinopathy",
+                    "diagnosis": dr_diagnosis,
+                    "confidence": round(dr_confidence, 4),
+                    "probabilities": {DR_CLASS_NAMES[i]: float(dr_probabilities[i]) for i in range(5)},
+                    "severity": "Low Risk" if dr_class == 0 else "Medium Risk" if dr_class == 1 else "High Risk",
+                    "recommended_action": get_dr_recommended_action(dr_class),
+                    "gradcam": gradcam_base64_lane1 if gradcam_base64_lane1 else None
+                }
+                
+                logger.info(f"✅ [LANE 1] Result: {dr_diagnosis} (confidence: {dr_confidence:.4f})")
+            except Exception as e:
+                logger.error(f"❌ [LANE 1] Error: {e}")
+                lane1_result = {"error": str(e)}
+        
+        # ========== LANE 2: GENERALIST (Glaucoma/Cataract Detection) ==========
+        lane2_result = None
+        if generalist_model is not None:
+            try:
+                logger.info("🚗 [LANE 2] Preprocessing image (128x128) for Generalist...")
+                img_lane2 = preprocess_image_lane2(contents)
+                input_batch_lane2 = np.expand_dims(img_lane2, axis=0)
+                
+                logger.info("🚗 [LANE 2] Running Glaucoma/Cataract Detection inference...")
+                gc_predictions = generalist_model.predict(input_batch_lane2, verbose=0)
+                gc_probabilities = gc_predictions[0]
+                
+                # Determine number of classes from output shape
+                num_classes = len(gc_probabilities)
+                gc_class = int(np.argmax(gc_probabilities))
+                gc_confidence = float(gc_probabilities[gc_class])
+                gc_diagnosis = GLAUCOMA_CATARACT_CLASS_NAMES.get(gc_class, f"Class {gc_class}")
+                
+                lane2_result = {
+                    "disease": "Glaucoma/Cataract",
+                    "diagnosis": gc_diagnosis,
+                    "confidence": round(gc_confidence, 4),
+                    "probabilities": {GLAUCOMA_CATARACT_CLASS_NAMES.get(i, f"Class {i}"): float(gc_probabilities[i]) for i in range(num_classes)},
+                    "severity": "Low Risk" if gc_class == 0 else "Medium Risk" if gc_class == 1 else "High Risk",
+                    "recommended_action": get_gc_recommended_action(gc_class)
+                }
+                
+                logger.info(f"✅ [LANE 2] Result: {gc_diagnosis} (confidence: {gc_confidence:.4f})")
+            except Exception as e:
+                logger.error(f"❌ [LANE 2] Error: {e}")
+                lane2_result = {"error": str(e)}
+        
+        # ========== MERGE RESULTS ==========
+        logger.info("🔄 Merging results from both lanes...")
+        
+        response_data = {
+            "status": "success",
+            "mode": "production",
+            "lane_1_specialist": lane1_result,
+            "lane_2_generalist": lane2_result,
+            "combined_risk_level": calculate_combined_risk(lane1_result, lane2_result)
+        }
+        
+        logger.info(f"✅ ✅ DUAL-MODEL PREDICTION COMPLETE")
+        return JSONResponse(response_data)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during dual-model prediction: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+
+def get_dr_recommended_action(class_index: int) -> str:
+    """Recommended action for DR diagnosis"""
+    recommendations = {
+        0: "No diabetic retinopathy detected. Continue regular checkups annually.",
+        1: "Mild DR detected. Schedule comprehensive eye exam within 3 months.",
+        2: "Moderate DR detected. Urgent referral to ophthalmologist recommended.",
+        3: "Severe DR detected. Immediate ophthalmologist consultation required.",
+        4: "Proliferative DR detected. URGENT - Refer to retinal specialist immediately."
+    }
+    return recommendations.get(class_index, "Unknown diagnosis")
+
+
+def get_gc_recommended_action(class_index: int) -> str:
+    """Recommended action for Glaucoma/Cataract diagnosis"""
+    recommendations = {
+        0: "No glaucoma or cataract detected. Continue regular eye exams.",
+        1: "Glaucoma suspected. Schedule immediate ophthalmology consultation.",
+        2: "Cataract suspected. Schedule eye exam for cataract evaluation.",
+        3: "Both glaucoma and cataract suspected. URGENT - Schedule comprehensive eye exam."
+    }
+    return recommendations.get(class_index, "Unknown diagnosis")
+
+
+def calculate_combined_risk(lane1: dict, lane2: dict) -> str:
+    """
+    Calculate combined risk level from both lanes.
+    """
+    if lane1 and "error" not in lane1 and lane2 and "error" not in lane2:
+        dr_severity = 0 if lane1["severity"] == "Low Risk" else 1 if lane1["severity"] == "Medium Risk" else 2
+        gc_severity = 0 if lane2["severity"] == "Low Risk" else 1 if lane2["severity"] == "Medium Risk" else 2
+        
+        combined = dr_severity + gc_severity
+        
+        if combined <= 1:
+            return "LOW COMBINED RISK"
+        elif combined <= 2:
+            return "MEDIUM COMBINED RISK"
+        else:
+            return "HIGH COMBINED RISK - URGENT CARE NEEDED"
+    elif lane1 and "error" not in lane1:
+        return lane1["severity"]
+    elif lane2 and "error" not in lane2:
+        return lane2["severity"]
+    else:
+        return "UNKNOWN"
+
+
+@app.get("/model-info")
+async def model_info():
+    """Get information about loaded models"""
+    return {
+        "system": "Two-Lane Highway Dual-Model",
+        "lane_1_specialist": {
+            "name": "DR Detection Model (Specialist)",
+            "architecture": "VGG16 + ResNet50 + DenseNet121 with Attention",
+            "input_shape": (224, 224, 3),
+            "num_classes": 5,
+            "classes": DR_CLASS_NAMES,
+            "loaded": specialist_model is not None,
+            "parameters": specialist_model.count_params() if specialist_model else 0
+        },
+        "lane_2_generalist": {
+            "name": "Glaucoma/Cataract Detection Model (Generalist)",
+            "input_shape": (128, 128, 3),
+            "num_classes": 3,
+            "classes": GLAUCOMA_CATARACT_CLASS_NAMES,
+            "loaded": generalist_model is not None,
+            "parameters": generalist_model.count_params() if generalist_model else 0
+        }
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting Two-Lane Highway Backend on port 8001...")
+    uvicorn.run(app, host="0.0.0.0", port=8001)

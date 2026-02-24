@@ -1,10 +1,11 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import App from './App';
+// Import the new Dual-Model App component
+import AppDualModel from './AppDualModel';
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(
   <React.StrictMode>
-    <App />
+    <AppDualModel />
   </React.StrictMode>
 );
